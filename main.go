@@ -6,9 +6,11 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv" // Import godotenv to read .env file
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -54,11 +56,28 @@ var client *mongo.Client
 var bookingCollection *mongo.Collection
 var logsCollection *mongo.Collection
 
-// SECURITY WARNING: In production, use Environment Variables for this connection string!
-const connectionString = "mongodb+srv://jmdayushkumar_db_user:6oe935cfRww7fQZP@cluster0.iii0dcr.mongodb.net/?appName=Cluster0"
-const dbName = "techathon_db" // Using the database name from your image
-
 func main() {
+	// --- Load Environment Variables ---
+	// Load .env file if it exists (mostly for local development)
+	if err := godotenv.Load(); err != nil {
+		fmt.Println("No .env file found, relying on system environment variables")
+	}
+
+	// Fetch variables from Environment
+	connectionString := os.Getenv("MONGO_URI")
+	dbName := os.Getenv("DB_NAME")
+	port := os.Getenv("PORT")
+
+	if connectionString == "" {
+		log.Fatal("MONGO_URI environment variable is not set")
+	}
+	if dbName == "" {
+		dbName = "techathon_db" // Default fallback
+	}
+	if port == "" {
+		port = "8080" // Default fallback
+	}
+
 	// --- 3. Connect to MongoDB ---
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -75,10 +94,9 @@ func main() {
 	if err != nil {
 		log.Fatal("Could not connect to MongoDB:", err)
 	}
-	fmt.Println("Connected to MongoDB (techathon_db) successfully!")
+	fmt.Println("Connected to MongoDB (" + dbName + ") successfully!")
 
 	// Initialize Collections
-	// These will be created automatically in techathon_db if they don't exist
 	db := client.Database(dbName)
 	bookingCollection = db.Collection("Bookings")
 	logsCollection = db.Collection("Logs")
@@ -88,8 +106,9 @@ func main() {
 
 	r.POST("/book-service", handleBooking)
 
-	fmt.Println("Server starting on port 8081...")
-	if err := r.Run(":8081"); err != nil {
+	fmt.Println("Server starting on port " + port + "...")
+	// Note: We use the dynamic port variable here
+	if err := r.Run(":" + port); err != nil {
 		log.Fatal("Failed to run server:", err)
 	}
 }
@@ -117,9 +136,8 @@ func handleBooking(c *gin.Context) {
 	fmt.Println("Step 1: Booking saved to 'Bookings' collection.")
 
 	// 3. Generate Data for 'Logs' Schema
-	// We generate IDs and Timestamps here as requested
 	currentTimestamp := time.Now().UTC().Format(time.RFC3339)
-	
+
 	// Create a random Log ID (e.g., LOG_20250203_999)
 	randNum := rand.Intn(10000)
 	logID := fmt.Sprintf("LOG_%s_%04d", time.Now().Format("20060102"), randNum)
@@ -143,8 +161,6 @@ func handleBooking(c *gin.Context) {
 	// 4. Store in 'Logs' Collection
 	_, err = logsCollection.InsertOne(ctx, newLog)
 	if err != nil {
-		// Note: We already saved the booking, but logging failed. 
-		// We still report success for the booking, but log the error internally.
 		fmt.Println("Error saving log:", err)
 	} else {
 		fmt.Println("Step 2: Log entry saved to 'Logs' collection.")
@@ -152,8 +168,8 @@ func handleBooking(c *gin.Context) {
 
 	// 5. Send Success Message to User
 	c.JSON(http.StatusOK, gin.H{
-		"message":          "Successfully saved",
-		"bookingStatus":    "Confirmed",
-		"generatedLogId":   logID, // Optional: returning the log ID for reference
+		"message":        "Successfully saved",
+		"bookingStatus":  "Confirmed",
+		"generatedLogId": logID,
 	})
 }
