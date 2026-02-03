@@ -1,6 +1,6 @@
 module github.com/kumar-ayush101/booking-and-log-service-ey
 
-go 1.25.5
+go 1.23.0
 
 require (
 	github.com/bytedance/sonic v1.14.0 // indirect
