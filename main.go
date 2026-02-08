@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/gin-contrib/cors" // <--- Import this package
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -99,14 +99,17 @@ func main() {
 	// --- 4. Setup Web Server ---
 	r := gin.Default()
 
-	// --- NEW: Add CORS Middleware Here ---
-	// This configuration allows requests from ANY source (frontend)
+	// CORS Middleware
 	config := cors.DefaultConfig()
 	config.AllowAllOrigins = true
 	config.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type", "Authorization"}
 	r.Use(cors.New(config))
-	// -------------------------------------
 
+	// --- ROUTES ---
+    // 1. Health Check Route (NEW) - Access via browser or GET request
+	r.GET("/system-status", handleSystemStatus) 
+    
+    // 2. Booking Route (Existing)
 	r.POST("/book-service", handleBooking)
 
 	fmt.Println("Server starting on port " + port + "...")
@@ -115,7 +118,16 @@ func main() {
 	}
 }
 
-// --- 5. Request Handler ---
+// --- 5. Request Handlers ---
+
+// NEW: Simple handler to check system status
+func handleSystemStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "Active",
+		"message": "System is running smoothly",
+		"time":    time.Now().Format(time.RFC3339),
+	})
+}
 
 func handleBooking(c *gin.Context) {
 	var booking BookingRequest
