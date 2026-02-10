@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -19,28 +18,24 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// --- 1. Define Data Structures ---
+// --- 1. CONFIGURATION ---
 
-// IncomingBookingRequest matches the JSON structure sent by the user
+const ExternalAPIBase = "https://admin-ey-1.onrender.com"
+
+// --- 2. DATA STRUCTURES ---
+
 type IncomingBookingRequest struct {
-	LogID     string              `json:"logId"`
-	UserID    string              `json:"userId"`
-	VehicleID string              `json:"vehicleId"`
-	Timestamp string              `json:"timestamp"`
-	LogType   string              `json:"logType"`
-	Data      IncomingBookingData `json:"data"`
+	VehicleID        string `json:"vehicleId"`
+	ConfirmationCode string `json:"confirmationCode"`
+	Status           string `json:"status"`
+	ScheduledService struct {
+		IsScheduled     bool   `json:"isScheduled"`
+		ServiceCenterID string `json:"serviceCenterId"`
+		DateTime        string `json:"dateTime"`
+	} `json:"scheduledService"`
 }
 
-type IncomingBookingData struct {
-	ConfirmationCode  string `json:"confirmationCode"`
-	Status            string `json:"status"`
-	ServiceCenterName string `json:"serviceCenterName"`
-	ScheduledAt       string `json:"scheduledAt"`
-	IsScheduled       bool   `json:"isScheduled"`
-	Action            string `json:"action"`
-}
-
-// DBBooking represents how we store the booking in our local MongoDB
+// Matches 'Bookings' schema in 'techathon_db'
 type DBBooking struct {
 	VehicleID        string           `json:"vehicleId" bson:"vehicleId"`
 	ConfirmationCode string           `json:"confirmationCode" bson:"confirmationCode"`
@@ -50,12 +45,12 @@ type DBBooking struct {
 }
 
 type ScheduledService struct {
-	IsScheduled       bool   `json:"isScheduled" bson:"isScheduled"`
-	ServiceCenterName string `json:"serviceCenterName" bson:"serviceCenterName"`
-	ServiceCenterID   string `json:"serviceCenterId" bson:"serviceCenterId"`
-	DateTime          string `json:"dateTime" bson:"dateTime"`
+	IsScheduled     bool   `json:"isScheduled" bson:"isScheduled"`
+	ServiceCenterID string `json:"serviceCenterId" bson:"serviceCenterId"`
+	DateTime        string `json:"dateTime" bson:"dateTime"`
 }
 
+// Matches 'Logs' schema in 'techathon_db'
 type LogEntry struct {
 	LogID     string  `json:"logId" bson:"logId"`
 	UserID    string  `json:"userId" bson:"userId"`
@@ -66,59 +61,46 @@ type LogEntry struct {
 }
 
 type LogData struct {
-	ConfirmationCode  string `json:"confirmationCode" bson:"confirmationCode"`
-	Status            string `json:"status" bson:"status"`
-	ServiceCenterName string `json:"serviceCenterName" bson:"serviceCenterName"`
-	ScheduledAt       string `json:"scheduledAt" bson:"scheduledAt"`
-	IsScheduled       bool   `json:"isScheduled" bson:"isScheduled"`
-	Action            string `json:"action" bson:"action"`
+	ConfirmationCode string `json:"confirmationCode" bson:"confirmationCode"`
+	Status           string `json:"status" bson:"status"`
+	ServiceCenterID  string `json:"serviceCenterId" bson:"serviceCenterId"`
+	ScheduledAt      string `json:"scheduledAt" bson:"scheduledAt"`
+	IsScheduled      bool   `json:"isScheduled" bson:"isScheduled"`
+	Action           string `json:"action" bson:"action"`
 }
 
-// ServiceCenter represents the structure returned by the external API
-type ServiceCenter struct {
-	ID              interface{}      `json:"_id"` // Handle ObjectId or string
-	CenterID        string           `json:"centerId"`
-	Name            string           `json:"name"`
-	Location        string           `json:"location"`
-	Capacity        int              `json:"capacity"`
-	Specializations []string         `json:"specializations"`
-	Bookings        []ServiceBooking `json:"bookings"`
-	IsActive        bool             `json:"is_active"`
+// Structure for API Response (Read-Only)
+type ExternalServiceCenter struct {
+	ID        string        `json:"centerId"`
+	Name      string        `json:"name"`
+	Location  string        `json:"location"`
+	Capacity  int           `json:"capacity"`
+	Bookings  []interface{} `json:"bookings"`
+	IsActive  bool          `json:"is_active"`
 }
 
-// ServiceBooking represents a booking inside the ServiceCenter object
-type ServiceBooking struct {
-	VehicleID        string `json:"vehicleId"`
-	ConfirmationCode string `json:"confirmationCode"`
-	Status           string `json:"status"`
-	ScheduledService struct {
-		IsScheduled       bool   `json:"isScheduled"`
-		ServiceCenterName string `json:"serviceCenterName"`
-		DateTime          string `json:"dateTime"`
-	} `json:"scheduledService"`
-}
-
-// --- 2. Database Configuration ---
+// --- 3. DATABASE SETUP ---
 
 var client *mongo.Client
+
+// Collections in 'techathon_db'
 var bookingCollection *mongo.Collection
 var logsCollection *mongo.Collection
 
-// Base URL for the external API
-const BaseURL = "https://admin-ey-1.onrender.com"
+// Collection in 'auto_ai_db' database
+var serviceCenterCollection *mongo.Collection
 
 func main() {
-	// --- Load Environment Variables ---
 	if err := godotenv.Load(); err != nil {
-		fmt.Println("No .env file found, relying on system environment variables")
+		fmt.Println("No .env file found")
 	}
 
 	connectionString := os.Getenv("MONGO_URI")
-	dbName := os.Getenv("DB_NAME")
+	dbName := os.Getenv("DB_NAME") // This should be 'techathon_db'
 	port := os.Getenv("PORT")
 
 	if connectionString == "" {
-		log.Fatal("MONGO_URI environment variable is not set")
+		log.Fatal("MONGO_URI is not set")
 	}
 	if dbName == "" {
 		dbName = "techathon_db"
@@ -127,7 +109,6 @@ func main() {
 		port = "8080"
 	}
 
-	// --- 3. Connect to MongoDB ---
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -142,219 +123,184 @@ func main() {
 	if err != nil {
 		log.Fatal("Could not connect to MongoDB:", err)
 	}
-	fmt.Println("Connected to MongoDB (" + dbName + ") successfully!")
+	fmt.Println("Connected to MongoDB Cluster successfully!")
 
-	db := client.Database(dbName)
-	bookingCollection = db.Collection("Bookings")
-	logsCollection = db.Collection("Logs")
+	// --- CRITICAL: Accessing Two Different Databases ---
 
-	// --- 4. Setup Web Server ---
+	// 1. Access 'techathon_db' (from .env)
+	techathonDB := client.Database(dbName)
+	bookingCollection = techathonDB.Collection("Bookings")
+	logsCollection = techathonDB.Collection("Logs")
+	fmt.Println("Linked to Database:", dbName)
+
+	// 2. Access 'auto_ai_db' database (Hardcoded as requested)
+	adminDB := client.Database("auto_ai_db")
+	serviceCenterCollection = adminDB.Collection("service_centers")
+	fmt.Println("Linked to Database: auto_ai_db (for service_centers updates)")
+
 	r := gin.Default()
-
-	// CORS Middleware
 	config := cors.DefaultConfig()
 	config.AllowAllOrigins = true
 	config.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type", "Authorization"}
 	r.Use(cors.New(config))
 
-	// --- ROUTES ---
-
-	// 1. Health Check
-	r.GET("/system-status", handleSystemStatus)
-
-	// 2. Get All Bookings (NEW)
+	r.GET("/system-status", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "Active"})
+	})
 	r.GET("/bookings", handleGetAllBookings)
-
-	// 3. Create Booking with Logic (UPDATED)
 	r.POST("/book-service", handleBooking)
 
 	fmt.Println("Server starting on port " + port + "...")
-	if err := r.Run(":" + port); err != nil {
-		log.Fatal("Failed to run server:", err)
-	}
+	r.Run(":" + port)
 }
 
-// --- 5. Request Handlers ---
+// --- 4. HANDLERS ---
 
-func handleSystemStatus(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status":  "Active",
-		"message": "System is running smoothly",
-		"time":    time.Now().Format(time.RFC3339),
-	})
-}
-
-// NEW: Get all bookings
 func handleGetAllBookings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	cursor, err := bookingCollection.Find(ctx, bson.M{})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch"})
 		return
 	}
 	defer cursor.Close(ctx)
-
 	var bookings []DBBooking
-	if err = cursor.All(ctx, &bookings); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings"})
-		return
-	}
-
+	cursor.All(ctx, &bookings)
 	c.JSON(http.StatusOK, bookings)
 }
 
-// UPDATED: Handle Booking with Smart Scheduling Logic
 func handleBooking(c *gin.Context) {
 	var req IncomingBookingRequest
-
-	// 1. Parse Incoming JSON
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON: " + err.Error()})
 		return
 	}
 
-	// 2. Extract Company Name (Logic: Trim part before underscore)
-	// Example: PQR_999 -> PQR
-	parts := strings.Split(req.VehicleID, "_")
-	if len(parts) < 1 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Vehicle ID format"})
-		return
-	}
-	companyName := parts[0]
-	fmt.Printf("Detected Company: %s from VehicleID: %s\n", companyName, req.VehicleID)
+	finalCenterID := req.ScheduledService.ServiceCenterID
+	isAutoAssigned := false
 
-	// 3. Fetch Service Centers from External API using Company Name
-	serviceCenters, err := fetchServiceCentersByName(companyName)
-	if err != nil {
-		fmt.Println("Error fetching service centers:", err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "Could not fetch service centers for company: " + companyName})
-		return
-	}
+	// --- STEP 1: Determine Center ID (Using API for Logic) ---
+	if finalCenterID == "" || finalCenterID == "null" {
+		fmt.Println("⚠️ Center ID missing. Fetching all centers from API to decide...")
 
-	if len(serviceCenters) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "No service centers found for company: " + companyName})
-		return
-	}
+		centers, err := fetchAllCenters()
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to fetch centers: " + err.Error()})
+			return
+		}
 
-	// 4. Find the Best Service Center (Maximum Free Capacity)
-	var selectedCenter *ServiceCenter
-	maxFreeSlots := -1
+		// Algorithm: Find Least Occupied
+		var bestCenter *ExternalServiceCenter
+		minBookings := 999999
 
-	for _, center := range serviceCenters {
-		if center.IsActive {
-			currentBookings := len(center.Bookings)
-			freeSlots := center.Capacity - currentBookings
-
-			fmt.Printf("Center: %s, Capacity: %d, Bookings: %d, Free: %d\n", center.Name, center.Capacity, currentBookings, freeSlots)
-
-			if freeSlots > maxFreeSlots {
-				maxFreeSlots = freeSlots
-				// Store a copy of the center so we don't lose it
+		for _, center := range centers {
+			// Basic load balancing
+			if len(center.Bookings) < minBookings {
+				minBookings = len(center.Bookings)
 				temp := center
-				selectedCenter = &temp
+				bestCenter = &temp
 			}
 		}
+
+		if bestCenter == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "No centers available"})
+			return
+		}
+
+		finalCenterID = bestCenter.ID
+		isAutoAssigned = true
+		fmt.Printf("✅ Auto-assigned: %s (%s)\n", bestCenter.Name, finalCenterID)
 	}
 
-	if selectedCenter == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "No active service centers found with availability"})
-		return
-	}
-
-	fmt.Printf(">>> Selected Service Center: %s (ID: %s) with %d free slots\n", selectedCenter.Name, selectedCenter.CenterID, maxFreeSlots)
-
-	// 5. Prepare Booking Data
-	scheduledTime := req.Data.ScheduledAt
-	if scheduledTime == "" {
-		scheduledTime = time.Now().UTC().Format(time.RFC3339)
-	}
-
-	newBooking := DBBooking{
+	// --- STEP 2: Save to 'techathon_db' -> 'Bookings' ---
+	bookingToSave := DBBooking{
 		VehicleID:        req.VehicleID,
-		ConfirmationCode: req.Data.ConfirmationCode,
-		Status:           req.Data.Status,
-		UserID:           req.UserID,
+		ConfirmationCode: req.ConfirmationCode,
+		Status:           req.Status,
 		ScheduledService: ScheduledService{
-			IsScheduled:       true,
-			ServiceCenterName: selectedCenter.Name,
-			ServiceCenterID:   selectedCenter.CenterID,
-			DateTime:          scheduledTime,
+			IsScheduled:     req.ScheduledService.IsScheduled,
+			ServiceCenterID: finalCenterID,
+			DateTime:        req.ScheduledService.DateTime,
 		},
+		UserID: "USR_" + req.VehicleID, // Placeholder for user lookup logic
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 6. Save to Local MongoDB 'Bookings' Collection
-	_, err = bookingCollection.InsertOne(ctx, newBooking)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save booking locally"})
+	if _, err := bookingCollection.InsertOne(ctx, bookingToSave); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB Save Failed"})
 		return
 	}
 
-	// 7. Save Log Entry to 'Logs' Collection
-	// Use incoming log ID or generate one
-	logID := req.LogID
-	if logID == "" {
-		randNum := rand.Intn(10000)
-		logID = fmt.Sprintf("LOG_%s_%04d", time.Now().Format("20060102"), randNum)
-	}
+	// --- STEP 3: Save to 'techathon_db' -> 'Logs' ---
+	randNum := rand.Intn(10000)
+	logID := fmt.Sprintf("LOG_%s_%04d", time.Now().Format("20060102"), randNum)
 
-	newLog := LogEntry{
+	logEntry := LogEntry{
 		LogID:     logID,
-		UserID:    req.UserID,
+		UserID:    bookingToSave.UserID,
 		VehicleID: req.VehicleID,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		LogType:   "BOOKING_CONFIRMED",
+		LogType:   "BOOKING",
 		Data: LogData{
-			ConfirmationCode:  req.Data.ConfirmationCode,
-			Status:            "CONFIRMED",
-			ServiceCenterName: selectedCenter.Name,
-			ScheduledAt:       scheduledTime,
-			IsScheduled:       true,
-			Action:            "ASSIGNED_CENTER_" + selectedCenter.CenterID,
+			ConfirmationCode: req.ConfirmationCode,
+			Status:           req.Status,
+			ServiceCenterID:  finalCenterID,
+			ScheduledAt:      req.ScheduledService.DateTime,
+			IsScheduled:      req.ScheduledService.IsScheduled,
+			Action:           "CREATED",
 		},
 	}
-
-	_, err = logsCollection.InsertOne(ctx, newLog)
-	if err != nil {
-		fmt.Println("Error saving log:", err)
+	if isAutoAssigned {
+		logEntry.Data.Action = "AUTO_ASSIGNED_CREATED"
 	}
+	logsCollection.InsertOne(ctx, logEntry)
 
-	// 8. NOTE: To "add the new Booking to the booking array of that service center",
-	// you would typically send a PUT/POST request back to the external API here.
-	// Since no update endpoint was provided, we assume the local DB is the record
-	// or that this step is handled by another service syncing with our DB.
-	// Example call (commented out):
-	// updateRemoteServiceCenter(selectedCenter.CenterID, newBooking)
+	// --- STEP 4: Update 'auto_ai_db' -> 'service_centers' (DIRECT DB UPDATE) ---
+	// This uses the "serviceCenterCollection" which is connected to the 'auto_ai_db' database.
+	// We use $push to append the new booking to the 'bookings' array.
+	go func() {
+		fmt.Printf("🔄 Updating 'auto_ai_db' database for center %s...\n", finalCenterID)
 
-	// 9. Response
+		filter := bson.M{"centerId": finalCenterID}
+		update := bson.M{
+			"$push": bson.M{
+				"bookings": bookingToSave,
+			},
+		}
+
+		// Use a separate context for the background task
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer bgCancel()
+
+		result, err := serviceCenterCollection.UpdateOne(bgCtx, filter, update)
+		if err != nil {
+			fmt.Printf("❌ DB Update Failed: %v\n", err)
+		} else {
+			fmt.Printf("✅ DB Update Success. Modified Count: %d\n", result.ModifiedCount)
+		}
+	}()
+
+	// Response
 	c.JSON(http.StatusOK, gin.H{
-		"message":            "Booking successfully scheduled",
-		"assignedCenter":     selectedCenter.Name,
-		"assignedCenterId":   selectedCenter.CenterID,
-		"location":           selectedCenter.Location,
-		"scheduledAt":        scheduledTime,
-		"bookingReferenceId": newBooking.ConfirmationCode,
+		"bookingStatus":  "Confirmed",
+		"generatedLogId": logID,
+		"message":        "Successfully saved",
 	})
 }
 
-// --- 6. Helper Functions ---
+// --- HELPER FUNCTIONS ---
 
-// fetchServiceCentersByName makes a GET request to the external API
-// URL: https://admin-ey-1.onrender.com/get-center-by-name/{name}
-func fetchServiceCentersByName(companyName string) ([]ServiceCenter, error) {
-	// Construct the dynamic URL
-	url := fmt.Sprintf("%s/get-center-by-name/%s", BaseURL, companyName)
-	fmt.Println("Fetching centers from:", url)
+// --- HELPER FUNCTIONS ---
 
-	// Create a client with timeout
-	client := http.Client{
-		Timeout: 10 * time.Second,
-	}
-
+func fetchAllCenters() ([]ExternalServiceCenter, error) {
+	url := fmt.Sprintf("%s/get-all-centers", ExternalAPIBase)
+	
+	// FIX: Increased timeout from 10s to 60s to handle Render's "Cold Start" delay
+	client := http.Client{Timeout: 60 * time.Second}
+	
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
@@ -362,13 +308,12 @@ func fetchServiceCentersByName(companyName string) ([]ServiceCenter, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("external API returned status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("status: %d", resp.StatusCode)
 	}
 
-	var centers []ServiceCenter
+	var centers []ExternalServiceCenter
 	if err := json.NewDecoder(resp.Body).Decode(&centers); err != nil {
 		return nil, err
 	}
-
 	return centers, nil
 }
