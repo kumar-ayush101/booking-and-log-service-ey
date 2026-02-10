@@ -71,12 +71,12 @@ type LogData struct {
 
 // Structure for API Response (Read-Only)
 type ExternalServiceCenter struct {
-	ID        string        `json:"centerId"`
-	Name      string        `json:"name"`
-	Location  string        `json:"location"`
-	Capacity  int           `json:"capacity"`
-	Bookings  []interface{} `json:"bookings"`
-	IsActive  bool          `json:"is_active"`
+	ID       string        `json:"centerId"`
+	Name     string        `json:"name"`
+	Location string        `json:"location"`
+	Capacity int           `json:"capacity"`
+	Bookings []interface{} `json:"bookings"`
+	IsActive bool          `json:"is_active"`
 }
 
 // --- 3. DATABASE SETUP ---
@@ -147,7 +147,10 @@ func main() {
 	r.GET("/system-status", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "Active"})
 	})
+	
+	// --- ROUTES ---
 	r.GET("/bookings", handleGetAllBookings)
+	r.GET("/logs", handleGetAllLogs) // <--- NEW ROUTE ADDED HERE
 	r.POST("/book-service", handleBooking)
 
 	fmt.Println("Server starting on port " + port + "...")
@@ -155,6 +158,28 @@ func main() {
 }
 
 // --- 4. HANDLERS ---
+
+// New Handler to get all Logs
+func handleGetAllLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Find all documents in the Logs collection
+	cursor, err := logsCollection.Find(ctx, bson.M{})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch logs"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var logs []LogEntry
+	if err = cursor.All(ctx, &logs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error decoding logs"})
+		return
+	}
+
+	c.JSON(http.StatusOK, logs)
+}
 
 func handleGetAllBookings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -293,14 +318,12 @@ func handleBooking(c *gin.Context) {
 
 // --- HELPER FUNCTIONS ---
 
-// --- HELPER FUNCTIONS ---
-
 func fetchAllCenters() ([]ExternalServiceCenter, error) {
 	url := fmt.Sprintf("%s/get-all-centers", ExternalAPIBase)
-	
+
 	// FIX: Increased timeout from 10s to 60s to handle Render's "Cold Start" delay
 	client := http.Client{Timeout: 60 * time.Second}
-	
+
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
