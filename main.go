@@ -147,7 +147,7 @@ func main() {
 	r.GET("/system-status", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "Active"})
 	})
-	
+
 	// --- ROUTES ---
 	r.GET("/bookings", handleGetAllBookings)
 	r.GET("/logs", handleGetAllLogs) // <--- NEW ROUTE ADDED HERE
@@ -210,32 +210,38 @@ func handleBooking(c *gin.Context) {
 		fmt.Println("⚠️ Center ID missing. Fetching all centers from API to decide...")
 
 		centers, err := fetchAllCenters()
+
+		// --- MODIFIED: Fallback Logic Added Here ---
 		if err != nil {
-			c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to fetch centers: " + err.Error()})
-			return
-		}
+			fmt.Println("API failed or Rate Limited (429), using fallback center")
+			// Manually assign a center if API fails
+			finalCenterID = "CENTER_001" // Ensure this ID exists in your DB or logic
+			isAutoAssigned = true
+		} else {
+			// --- Existing Logic to Find Best Center (Only runs if API succeeded) ---
+			// Algorithm: Find Least Occupied
+			var bestCenter *ExternalServiceCenter
+			minBookings := 999999
 
-		// Algorithm: Find Least Occupied
-		var bestCenter *ExternalServiceCenter
-		minBookings := 999999
-
-		for _, center := range centers {
-			// Basic load balancing
-			if len(center.Bookings) < minBookings {
-				minBookings = len(center.Bookings)
-				temp := center
-				bestCenter = &temp
+			for _, center := range centers {
+				// Basic load balancing
+				if len(center.Bookings) < minBookings {
+					minBookings = len(center.Bookings)
+					temp := center
+					bestCenter = &temp
+				}
 			}
-		}
 
-		if bestCenter == nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "No centers available"})
-			return
-		}
+			if bestCenter == nil {
+				// If API worked but returned 0 centers, this is still a problem
+				c.JSON(http.StatusNotFound, gin.H{"error": "No centers available"})
+				return
+			}
 
-		finalCenterID = bestCenter.ID
-		isAutoAssigned = true
-		fmt.Printf("✅ Auto-assigned: %s (%s)\n", bestCenter.Name, finalCenterID)
+			finalCenterID = bestCenter.ID
+			isAutoAssigned = true
+			fmt.Printf("✅ Auto-assigned: %s (%s)\n", bestCenter.Name, finalCenterID)
+		}
 	}
 
 	// --- STEP 2: Save to 'techathon_db' -> 'Bookings' ---
