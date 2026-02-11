@@ -19,7 +19,6 @@ import (
 
 // --- 1. CONFIGURATION ---
 
-// (ExternalAPIBase is no longer needed for fetching centers, but kept if you use it elsewhere)
 const ExternalAPIBase = "https://admin-ey-1.onrender.com"
 
 // --- 2. DATA STRUCTURES ---
@@ -30,7 +29,7 @@ type IncomingBookingRequest struct {
 	Status           string `json:"status"`
 	ScheduledService struct {
 		IsScheduled     bool   `json:"isScheduled"`
-		ServiceCenterID string `json:"serviceCenterId"`
+		ServiceCenterID string `json:"serviceCenterId"` // Maps to ID used in logic
 		DateTime        string `json:"dateTime"`
 	} `json:"scheduledService"`
 }
@@ -70,25 +69,20 @@ type LogData struct {
 }
 
 // Matches 'service_centers' schema in 'auto_ai_db'
-// We use this for internal DB querying now, not the API response structure
 type ServiceCenterDBModel struct {
 	ID       string        `json:"centerId" bson:"centerId"`
 	Name     string        `json:"name" bson:"name"`
 	Location string        `json:"location" bson:"location"`
 	Capacity int           `json:"capacity" bson:"capacity"`
-	Bookings []interface{} `json:"bookings" bson:"bookings"` // We just need the length
+	Bookings []interface{} `json:"bookings" bson:"bookings"`
 	IsActive bool          `json:"is_active" bson:"is_active"`
 }
 
 // --- 3. DATABASE SETUP ---
 
 var client *mongo.Client
-
-// Collections in 'techathon_db'
 var bookingCollection *mongo.Collection
 var logsCollection *mongo.Collection
-
-// Collection in 'auto_ai_db' database
 var serviceCenterCollection *mongo.Collection
 
 func main() {
@@ -97,7 +91,7 @@ func main() {
 	}
 
 	connectionString := os.Getenv("MONGO_URI")
-	dbName := os.Getenv("DB_NAME") // This should be 'techathon_db'
+	dbName := os.Getenv("DB_NAME")
 	port := os.Getenv("PORT")
 
 	if connectionString == "" {
@@ -126,25 +120,7 @@ func main() {
 	}
 	fmt.Println("Connected to MongoDB Cluster successfully!")
 
-	// ... inside main(), after client.Ping ...
-
-    fmt.Println("Connected to MongoDB Cluster successfully!")
-
-    // --- DEBUG: LIST DATABASES ---
-    // This proves if Render can actually "see" the auto_ai_db
-    databases, err := client.ListDatabaseNames(ctx, bson.M{})
-    if err != nil {
-        fmt.Println("❌ Error listing databases:", err)
-    } else {
-        fmt.Println("✅ Available Databases:", databases)
-    }
-    // -----------------------------
-
-    // 1. Access 'techathon_db' ...
-
-	// --- CRITICAL: Accessing Two Different Databases ---
-
-	// 1. Access 'techathon_db' (from .env)
+	// 1. Access 'techathon_db'
 	techathonDB := client.Database(dbName)
 	bookingCollection = techathonDB.Collection("Bookings")
 	logsCollection = techathonDB.Collection("Logs")
@@ -165,7 +141,6 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "Active"})
 	})
 
-	// --- ROUTES ---
 	r.GET("/bookings", handleGetAllBookings)
 	r.GET("/logs", handleGetAllLogs)
 	r.POST("/book-service", handleBooking)
@@ -192,7 +167,6 @@ func handleGetAllLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error decoding logs"})
 		return
 	}
-
 	c.JSON(http.StatusOK, logs)
 }
 
@@ -217,17 +191,51 @@ func handleBooking(c *gin.Context) {
 		return
 	}
 
+	// Generate a Log ID immediately (needed for response even if rejected)
+	randNum := rand.Intn(10000)
+	currentLogID := fmt.Sprintf("LOG_%s_%04d", time.Now().Format("20060102"), randNum)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// --- CHECK EXISTING BOOKING ---
+	var existingBooking DBBooking
+	err := bookingCollection.FindOne(ctx, bson.M{"vehicleId": req.VehicleID}).Decode(&existingBooking)
+
+	isUpdate := false // Flag to track if we are updating or inserting
+
+	if err == nil {
+		// Found existing booking
+		if existingBooking.ScheduledService.IsScheduled {
+			// SCENARIO: Entry exists AND isScheduled is TRUE -> Return "already booked"
+			c.JSON(http.StatusOK, gin.H{
+				"assignedCenter": existingBooking.ScheduledService.ServiceCenterID,
+				"bookingStatus":  existingBooking.Status,
+				"generatedLogId": currentLogID, // Returned as requested
+				"message":        "already booked",
+			})
+			return
+		} else {
+			// SCENARIO: Entry exists BUT isScheduled is FALSE -> Update this entry
+			fmt.Printf("⚠️ Booking exists for %s but not scheduled. Updating entry...\n", req.VehicleID)
+			isUpdate = true
+		}
+	} else if err == mongo.ErrNoDocuments {
+		// SCENARIO: No entry exists -> Create new
+		isUpdate = false
+	} else {
+		// Real DB Error
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB Error checking existence"})
+		return
+	}
+
+	// --- LOGIC TO DETERMINE CENTER ID (Runs for both New and Update scenarios) ---
 	finalCenterID := req.ScheduledService.ServiceCenterID
 	isAutoAssigned := false
 
-	// --- STEP 1: Determine Center ID (DB Logic) ---
 	if finalCenterID == "" || finalCenterID == "null" {
 		fmt.Println("⚠️ Center ID missing. Querying DB for least busy center...")
 
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		// Fetch all active centers
 		filter := bson.M{"is_active": true}
 		cursor, err := serviceCenterCollection.Find(ctx, filter)
 		if err != nil {
@@ -242,20 +250,14 @@ func handleBooking(c *gin.Context) {
 			return
 		}
 
-		// Algorithm: Find Least Occupied
 		var bestCenter *ServiceCenterDBModel
 		minBookings := 999999
 
 		for i := range centers {
-			// --- CRITICAL FIX: Skip centers with missing IDs ---
 			if centers[i].ID == "" {
-				fmt.Printf("⚠️ Skipping Center '%s' (Missing centerId in DB)\n", centers[i].Name)
 				continue
 			}
-
 			currentLoad := len(centers[i].Bookings)
-			
-			// Check if this center is less busy than the current minimum
 			if currentLoad < minBookings {
 				minBookings = currentLoad
 				bestCenter = &centers[i]
@@ -263,17 +265,16 @@ func handleBooking(c *gin.Context) {
 		}
 
 		if bestCenter == nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "No valid service centers available (Check DB for missing centerIds)"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "No valid service centers available"})
 			return
 		}
 
 		finalCenterID = bestCenter.ID
 		isAutoAssigned = true
-		fmt.Printf("✅ Auto-assigned: %s (%s) | Current Load: %d\n", bestCenter.Name, finalCenterID, minBookings)
 	}
 
-	// --- STEP 2: Save to 'techathon_db' -> 'Bookings' ---
-	bookingToSave := DBBooking{
+	// --- PREPARE DATA ---
+	bookingData := DBBooking{
 		VehicleID:        req.VehicleID,
 		ConfirmationCode: req.ConfirmationCode,
 		Status:           req.Status,
@@ -282,24 +283,39 @@ func handleBooking(c *gin.Context) {
 			ServiceCenterID: finalCenterID,
 			DateTime:        req.ScheduledService.DateTime,
 		},
-		UserID: "USR_" + req.VehicleID, 
+		UserID: "USR_" + req.VehicleID,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if _, err := bookingCollection.InsertOne(ctx, bookingToSave); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB Save Failed"})
-		return
+	// --- EXECUTE DB WRITE (INSERT OR UPDATE) ---
+	if isUpdate {
+		// Update existing document
+		filter := bson.M{"vehicleId": req.VehicleID}
+		update := bson.M{
+			"$set": bson.M{
+				"confirmationCode": bookingData.ConfirmationCode,
+				"status":           bookingData.Status,
+				"scheduledService": bookingData.ScheduledService,
+				"userId":           bookingData.UserID,
+			},
+		}
+		_, err := bookingCollection.UpdateOne(ctx, filter, update)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update booking"})
+			return
+		}
+	} else {
+		// Insert new document
+		_, err := bookingCollection.InsertOne(ctx, bookingData)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create booking"})
+			return
+		}
 	}
 
-	// --- STEP 3: Save to 'techathon_db' -> 'Logs' ---
-	randNum := rand.Intn(10000)
-	logID := fmt.Sprintf("LOG_%s_%04d", time.Now().Format("20060102"), randNum)
-
+	// --- LOGGING ---
 	logEntry := LogEntry{
-		LogID:     logID,
-		UserID:    bookingToSave.UserID,
+		LogID:     currentLogID,
+		UserID:    bookingData.UserID,
 		VehicleID: req.VehicleID,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		LogType:   "BOOKING",
@@ -312,43 +328,32 @@ func handleBooking(c *gin.Context) {
 			Action:           "CREATED",
 		},
 	}
-	if isAutoAssigned {
+	if isUpdate {
+		logEntry.Data.Action = "UPDATED_SCHEDULE"
+	} else if isAutoAssigned {
 		logEntry.Data.Action = "AUTO_ASSIGNED_CREATED"
 	}
 	logsCollection.InsertOne(ctx, logEntry)
 
-	// --- STEP 4: Update 'auto_ai_db' -> 'service_centers' ---
+	// --- UPDATE EXTERNAL DB (Background) ---
 	go func() {
-		// Use a fresh context for background task
 		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer bgCancel()
 
 		fmt.Printf("🔄 Updating 'auto_ai_db' -> Center: %s\n", finalCenterID)
-
 		filter := bson.M{"centerId": finalCenterID}
-		update := bson.M{
-			"$push": bson.M{
-				"bookings": bookingToSave,
-			},
-		}
+		update := bson.M{"$push": bson.M{"bookings": bookingData}}
 
-		result, err := serviceCenterCollection.UpdateOne(bgCtx, filter, update)
+		_, err := serviceCenterCollection.UpdateOne(bgCtx, filter, update)
 		if err != nil {
 			fmt.Printf("❌ DB Update Failed: %v\n", err)
-		} else {
-			// DEBUG: Print if we actually modified anything
-			if result.ModifiedCount == 0 {
-				fmt.Printf("⚠️ Warning: Update ran but modified 0 documents. Check if centerId '%s' exists in DB.\n", finalCenterID)
-			} else {
-				fmt.Printf("✅ DB Update Success. Modified Count: %d\n", result.ModifiedCount)
-			}
 		}
 	}()
 
 	// Response
 	c.JSON(http.StatusOK, gin.H{
 		"bookingStatus":  "Confirmed",
-		"generatedLogId": logID,
+		"generatedLogId": currentLogID,
 		"assignedCenter": finalCenterID,
 		"message":        "Successfully saved",
 	})
