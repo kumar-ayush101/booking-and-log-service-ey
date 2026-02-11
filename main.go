@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -20,6 +19,7 @@ import (
 
 // --- 1. CONFIGURATION ---
 
+// (ExternalAPIBase is no longer needed for fetching centers, but kept if you use it elsewhere)
 const ExternalAPIBase = "https://admin-ey-1.onrender.com"
 
 // --- 2. DATA STRUCTURES ---
@@ -69,14 +69,15 @@ type LogData struct {
 	Action           string `json:"action" bson:"action"`
 }
 
-// Structure for API Response (Read-Only)
-type ExternalServiceCenter struct {
-	ID       string        `json:"centerId"`
-	Name     string        `json:"name"`
-	Location string        `json:"location"`
-	Capacity int           `json:"capacity"`
-	Bookings []interface{} `json:"bookings"`
-	IsActive bool          `json:"is_active"`
+// Matches 'service_centers' schema in 'auto_ai_db'
+// We use this for internal DB querying now, not the API response structure
+type ServiceCenterDBModel struct {
+	ID       string        `json:"centerId" bson:"centerId"`
+	Name     string        `json:"name" bson:"name"`
+	Location string        `json:"location" bson:"location"`
+	Capacity int           `json:"capacity" bson:"capacity"`
+	Bookings []interface{} `json:"bookings" bson:"bookings"` // We just need the length
+	IsActive bool          `json:"is_active" bson:"is_active"`
 }
 
 // --- 3. DATABASE SETUP ---
@@ -133,7 +134,7 @@ func main() {
 	logsCollection = techathonDB.Collection("Logs")
 	fmt.Println("Linked to Database:", dbName)
 
-	// 2. Access 'auto_ai_db' database (Hardcoded as requested)
+	// 2. Access 'auto_ai_db' database
 	adminDB := client.Database("auto_ai_db")
 	serviceCenterCollection = adminDB.Collection("service_centers")
 	fmt.Println("Linked to Database: auto_ai_db (for service_centers updates)")
@@ -150,7 +151,7 @@ func main() {
 
 	// --- ROUTES ---
 	r.GET("/bookings", handleGetAllBookings)
-	r.GET("/logs", handleGetAllLogs) // <--- NEW ROUTE ADDED HERE
+	r.GET("/logs", handleGetAllLogs)
 	r.POST("/book-service", handleBooking)
 
 	fmt.Println("Server starting on port " + port + "...")
@@ -159,12 +160,10 @@ func main() {
 
 // --- 4. HANDLERS ---
 
-// New Handler to get all Logs
 func handleGetAllLogs(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Find all documents in the Logs collection
 	cursor, err := logsCollection.Find(ctx, bson.M{})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch logs"})
@@ -205,43 +204,62 @@ func handleBooking(c *gin.Context) {
 	finalCenterID := req.ScheduledService.ServiceCenterID
 	isAutoAssigned := false
 
-	// --- STEP 1: Determine Center ID (Using API for Logic) ---
+	// --- STEP 1: Determine Center ID (DB Logic) ---
 	if finalCenterID == "" || finalCenterID == "null" {
-		fmt.Println("⚠️ Center ID missing. Fetching all centers from API to decide...")
+		fmt.Println("⚠️ Center ID missing. Querying DB for least busy center...")
 
-		centers, err := fetchAllCenters()
+		// 1. Fetch all active centers directly from DB
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
-		// --- MODIFIED: Fallback Logic Added Here ---
+		// Filter for active centers only
+		filter := bson.M{"is_active": true}
+		cursor, err := serviceCenterCollection.Find(ctx, filter)
 		if err != nil {
-			fmt.Println("API failed or Rate Limited (429), using fallback center")
-			// Manually assign a center if API fails
-			finalCenterID = "CENTER_001" // Ensure this ID exists in your DB or logic
-			isAutoAssigned = true
-		} else {
-			// --- Existing Logic to Find Best Center (Only runs if API succeeded) ---
-			// Algorithm: Find Least Occupied
-			var bestCenter *ExternalServiceCenter
-			minBookings := 999999
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query service centers from DB"})
+			return
+		}
+		defer cursor.Close(ctx)
 
-			for _, center := range centers {
-				// Basic load balancing
-				if len(center.Bookings) < minBookings {
-					minBookings = len(center.Bookings)
-					temp := center
-					bestCenter = &temp
+		var centers []ServiceCenterDBModel
+		if err = cursor.All(ctx, &centers); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode service centers"})
+			return
+		}
+
+		if len(centers) == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "No active service centers found in database"})
+			return
+		}
+
+		// 2. Algorithm: Find Least Occupied
+		var bestCenter *ServiceCenterDBModel
+		minBookings := 999999
+
+		for i := range centers {
+			currentLoad := len(centers[i].Bookings)
+			// Check if this center has fewer bookings than the current minimum
+			// Also check capacity (optional, but good practice)
+			if currentLoad < minBookings && currentLoad < centers[i].Capacity {
+				minBookings = currentLoad
+				bestCenter = &centers[i] // Point to the actual struct in the slice
+			}
+		}
+
+		if bestCenter == nil {
+			// Fallback: If all are full (capacity check failed), just pick the one with absolute min bookings
+			// Or if loop didn't find anything for some reason, pick the first one.
+			bestCenter = &centers[0]
+			for i := range centers {
+				if len(centers[i].Bookings) < len(bestCenter.Bookings) {
+					bestCenter = &centers[i]
 				}
 			}
-
-			if bestCenter == nil {
-				// If API worked but returned 0 centers, this is still a problem
-				c.JSON(http.StatusNotFound, gin.H{"error": "No centers available"})
-				return
-			}
-
-			finalCenterID = bestCenter.ID
-			isAutoAssigned = true
-			fmt.Printf("✅ Auto-assigned: %s (%s)\n", bestCenter.Name, finalCenterID)
 		}
+
+		finalCenterID = bestCenter.ID
+		isAutoAssigned = true
+		fmt.Printf("✅ Auto-assigned: %s (%s) | Current Load: %d\n", bestCenter.Name, finalCenterID, minBookings)
 	}
 
 	// --- STEP 2: Save to 'techathon_db' -> 'Bookings' ---
@@ -254,7 +272,7 @@ func handleBooking(c *gin.Context) {
 			ServiceCenterID: finalCenterID,
 			DateTime:        req.ScheduledService.DateTime,
 		},
-		UserID: "USR_" + req.VehicleID, // Placeholder for user lookup logic
+		UserID: "USR_" + req.VehicleID, // Placeholder
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -290,11 +308,10 @@ func handleBooking(c *gin.Context) {
 	logsCollection.InsertOne(ctx, logEntry)
 
 	// --- STEP 4: Update 'auto_ai_db' -> 'service_centers' (DIRECT DB UPDATE) ---
-	// This uses the "serviceCenterCollection" which is connected to the 'auto_ai_db' database.
-	// We use $push to append the new booking to the 'bookings' array.
 	go func() {
 		fmt.Printf("🔄 Updating 'auto_ai_db' database for center %s...\n", finalCenterID)
 
+		// We use the same collection we just queried
 		filter := bson.M{"centerId": finalCenterID}
 		update := bson.M{
 			"$push": bson.M{
@@ -302,7 +319,6 @@ func handleBooking(c *gin.Context) {
 			},
 		}
 
-		// Use a separate context for the background task
 		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer bgCancel()
 
@@ -318,31 +334,7 @@ func handleBooking(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"bookingStatus":  "Confirmed",
 		"generatedLogId": logID,
+		"assignedCenter": finalCenterID, // Added for clarity in response
 		"message":        "Successfully saved",
 	})
-}
-
-// --- HELPER FUNCTIONS ---
-
-func fetchAllCenters() ([]ExternalServiceCenter, error) {
-	url := fmt.Sprintf("%s/get-all-centers", ExternalAPIBase)
-
-	// FIX: Increased timeout from 10s to 60s to handle Render's "Cold Start" delay
-	client := http.Client{Timeout: 60 * time.Second}
-
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status: %d", resp.StatusCode)
-	}
-
-	var centers []ExternalServiceCenter
-	if err := json.NewDecoder(resp.Body).Decode(&centers); err != nil {
-		return nil, err
-	}
-	return centers, nil
 }
