@@ -126,6 +126,22 @@ func main() {
 	}
 	fmt.Println("Connected to MongoDB Cluster successfully!")
 
+	// ... inside main(), after client.Ping ...
+
+    fmt.Println("Connected to MongoDB Cluster successfully!")
+
+    // --- DEBUG: LIST DATABASES ---
+    // This proves if Render can actually "see" the auto_ai_db
+    databases, err := client.ListDatabaseNames(ctx, bson.M{})
+    if err != nil {
+        fmt.Println("❌ Error listing databases:", err)
+    } else {
+        fmt.Println("✅ Available Databases:", databases)
+    }
+    // -----------------------------
+
+    // 1. Access 'techathon_db' ...
+
 	// --- CRITICAL: Accessing Two Different Databases ---
 
 	// 1. Access 'techathon_db' (from .env)
@@ -208,15 +224,14 @@ func handleBooking(c *gin.Context) {
 	if finalCenterID == "" || finalCenterID == "null" {
 		fmt.Println("⚠️ Center ID missing. Querying DB for least busy center...")
 
-		// 1. Fetch all active centers directly from DB
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		// Filter for active centers only
+		// Fetch all active centers
 		filter := bson.M{"is_active": true}
 		cursor, err := serviceCenterCollection.Find(ctx, filter)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query service centers from DB"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query service centers"})
 			return
 		}
 		defer cursor.Close(ctx)
@@ -227,34 +242,29 @@ func handleBooking(c *gin.Context) {
 			return
 		}
 
-		if len(centers) == 0 {
-			c.JSON(http.StatusNotFound, gin.H{"error": "No active service centers found in database"})
-			return
-		}
-
-		// 2. Algorithm: Find Least Occupied
+		// Algorithm: Find Least Occupied
 		var bestCenter *ServiceCenterDBModel
 		minBookings := 999999
 
 		for i := range centers {
+			// --- CRITICAL FIX: Skip centers with missing IDs ---
+			if centers[i].ID == "" {
+				fmt.Printf("⚠️ Skipping Center '%s' (Missing centerId in DB)\n", centers[i].Name)
+				continue
+			}
+
 			currentLoad := len(centers[i].Bookings)
-			// Check if this center has fewer bookings than the current minimum
-			// Also check capacity (optional, but good practice)
-			if currentLoad < minBookings && currentLoad < centers[i].Capacity {
+			
+			// Check if this center is less busy than the current minimum
+			if currentLoad < minBookings {
 				minBookings = currentLoad
-				bestCenter = &centers[i] // Point to the actual struct in the slice
+				bestCenter = &centers[i]
 			}
 		}
 
 		if bestCenter == nil {
-			// Fallback: If all are full (capacity check failed), just pick the one with absolute min bookings
-			// Or if loop didn't find anything for some reason, pick the first one.
-			bestCenter = &centers[0]
-			for i := range centers {
-				if len(centers[i].Bookings) < len(bestCenter.Bookings) {
-					bestCenter = &centers[i]
-				}
-			}
+			c.JSON(http.StatusNotFound, gin.H{"error": "No valid service centers available (Check DB for missing centerIds)"})
+			return
 		}
 
 		finalCenterID = bestCenter.ID
@@ -272,7 +282,7 @@ func handleBooking(c *gin.Context) {
 			ServiceCenterID: finalCenterID,
 			DateTime:        req.ScheduledService.DateTime,
 		},
-		UserID: "USR_" + req.VehicleID, // Placeholder
+		UserID: "USR_" + req.VehicleID, 
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -307,11 +317,14 @@ func handleBooking(c *gin.Context) {
 	}
 	logsCollection.InsertOne(ctx, logEntry)
 
-	// --- STEP 4: Update 'auto_ai_db' -> 'service_centers' (DIRECT DB UPDATE) ---
+	// --- STEP 4: Update 'auto_ai_db' -> 'service_centers' ---
 	go func() {
-		fmt.Printf("🔄 Updating 'auto_ai_db' database for center %s...\n", finalCenterID)
+		// Use a fresh context for background task
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer bgCancel()
 
-		// We use the same collection we just queried
+		fmt.Printf("🔄 Updating 'auto_ai_db' -> Center: %s\n", finalCenterID)
+
 		filter := bson.M{"centerId": finalCenterID}
 		update := bson.M{
 			"$push": bson.M{
@@ -319,14 +332,16 @@ func handleBooking(c *gin.Context) {
 			},
 		}
 
-		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer bgCancel()
-
 		result, err := serviceCenterCollection.UpdateOne(bgCtx, filter, update)
 		if err != nil {
 			fmt.Printf("❌ DB Update Failed: %v\n", err)
 		} else {
-			fmt.Printf("✅ DB Update Success. Modified Count: %d\n", result.ModifiedCount)
+			// DEBUG: Print if we actually modified anything
+			if result.ModifiedCount == 0 {
+				fmt.Printf("⚠️ Warning: Update ran but modified 0 documents. Check if centerId '%s' exists in DB.\n", finalCenterID)
+			} else {
+				fmt.Printf("✅ DB Update Success. Modified Count: %d\n", result.ModifiedCount)
+			}
 		}
 	}()
 
@@ -334,7 +349,7 @@ func handleBooking(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"bookingStatus":  "Confirmed",
 		"generatedLogId": logID,
-		"assignedCenter": finalCenterID, // Added for clarity in response
+		"assignedCenter": finalCenterID,
 		"message":        "Successfully saved",
 	})
 }
