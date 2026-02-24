@@ -123,7 +123,7 @@ func main() {
 	// 1. Access 'techathon_db'
 	techathonDB := client.Database(dbName)
 	bookingCollection = techathonDB.Collection("Bookings")
-	logsCollection = techathonDB.Collection("logs")
+	logsCollection = techathonDB.Collection("Logs")
 	fmt.Println("Linked to Database:", dbName)
 
 	// 2. Access 'auto_ai_db' database
